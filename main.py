@@ -1,8 +1,8 @@
 import os
 import re
+import math
 import logging
 import mimetypes
-import math
 from aiohttp import web
 from pyrogram import Client
 
@@ -51,30 +51,22 @@ async def get_media_info(link):
         return msg, media
     except: return None, None
 
-def get_mime_type(file_name):
-    """ improved mime type guessing """
-    mime_type, _ = mimetypes.guess_type(file_name)
-    if not mime_type:
-        ext = file_name.split('.')[-1].lower()
-        if ext in ["mkv", "mp4", "webm", "avi", "mov"]:
-            return f"video/{ext if ext != 'mkv' else 'x-matroska'}"
-        return "application/octet-stream"
-    return mime_type
-
 @routes.get("/")
 async def home(request):
     html = """
     <!DOCTYPE html>
     <html>
     <head>
-        <title>TG Streamer Fixed</title>
+        <title>TG Streamer</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
-            body { background: #0f0f0f; color: #eee; font-family: sans-serif; padding: 20px; text-align: center;}
-            input { padding: 12px; width: 80%; border-radius: 8px; border: 1px solid #444; background: #222; color: white; }
-            button { padding: 12px 24px; border-radius: 8px; border: none; background: #0088cc; color: white; cursor: pointer; margin-top: 10px; }
-            .card { background: #1e1e1e; padding: 20px; border-radius: 12px; margin-top: 30px; display: none; }
-            a { color: #4db8ff; text-decoration: none; display: block; margin-bottom: 10px; word-break: break-all; }
+            body { background: #0f0f0f; color: #eee; font-family: system-ui, sans-serif; padding: 20px; text-align: center;}
+            input { padding: 12px; width: 80%; max-width: 400px; border-radius: 8px; border: 1px solid #444; background: #222; color: white; outline: none; }
+            button { padding: 12px 24px; border-radius: 8px; border: none; background: #0088cc; color: white; cursor: pointer; font-weight: bold; margin-top: 10px; }
+            button:hover { background: #0077b5; }
+            .card { background: #1e1e1e; padding: 20px; border-radius: 12px; margin-top: 30px; display: inline-block; text-align: left; max-width: 90%; }
+            a { color: #4db8ff; text-decoration: none; word-break: break-all; display: block; margin-bottom: 10px; }
+            h3 { margin-top: 0; }
         </style>
     </head>
     <body>
@@ -85,10 +77,11 @@ async def home(request):
             <button type="submit">Generate Links</button>
         </form>
         
-        <div id="result" class="card">
+        <div id="result" style="display:none;" class="card">
             <h3 id="fname">File Name</h3>
             <p>👇 <b>Direct Download:</b></p>
             <a id="dl_btn" href="#">Download Link</a>
+            
             <p>📺 <b>Watch in Browser:</b></p>
             <a id="watch_btn" href="#">Stream Page</a>
         </div>
@@ -108,9 +101,11 @@ async def home(request):
 
                 document.getElementById('dl_btn').href = dl;
                 document.getElementById('dl_btn').innerText = dl;
+                
                 document.getElementById('watch_btn').href = watch;
                 document.getElementById('watch_btn').innerText = watch;
-                document.getElementById('fname').innerText = "Links Ready";
+                
+                document.getElementById('fname').innerText = "Links Ready:";
             }
         </script>
     </body>
@@ -120,16 +115,29 @@ async def home(request):
 
 @routes.get("/watch/{link}")
 async def watch_player(request):
+    """Returns a page with a Video Player embedded"""
     link = request.match_info['link']
+    decoded_link = link # Already safe via match_info
     stream_url = f"/stream/{link}"
     
     html = f"""
     <!DOCTYPE html>
-    <body style="margin:0; background:black; display:flex; justify-content:center; align-items:center; height:100vh;">
-        <video controls autoplay width="100%" height="100%">
-            <source src="{stream_url}">
+    <html>
+    <head>
+        <title>Watching...</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body {{ margin: 0; background: black; display: flex; justify-content: center; align-items: center; height: 100vh; }}
+            video {{ width: 100%; max-width: 1000px; height: auto; max-height: 100vh; }}
+        </style>
+    </head>
+    <body>
+        <video controls autoplay>
+            <source src="{stream_url}" type="video/mp4">
+            Your browser does not support the video tag.
         </video>
     </body>
+    </html>
     """
     return web.Response(text=html, content_type='text/html')
 
@@ -144,85 +152,72 @@ async def stream_handler(request):
 
     file_name = getattr(media, "file_name", "video.mp4")
     file_size = getattr(media, "file_size", 0)
-    mime_type = get_mime_type(file_name)
+    mime_type = getattr(media, "mime_type", mimetypes.guess_type(file_name)[0] or "video/mp4")
 
-    # --- RANGE REQUEST HANDLING (The Fix) ---
+    # --- HANDLE RANGE REQUESTS (Seeking) ---
     range_header = request.headers.get("Range")
     
-    start = 0
-    end = file_size - 1
-    status_code = 200
-
     if range_header:
-        # Browser requested a specific part
-        range_match = re.search(r'bytes=(\d+)-(\d*)', range_header)
-        if range_match:
-            start = int(range_match.group(1))
-            if range_match.group(2):
-                end = int(range_match.group(2))
-            status_code = 206 # Partial Content
-
-    content_length = end - start + 1
-    
-    headers = {
-        "Content-Type": mime_type,
-        "Accept-Ranges": "bytes",
-        "Content-Length": str(content_length),
-    }
-
-    if status_code == 206:
-        headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
-
-    if force_download:
-        headers["Content-Disposition"] = f'attachment; filename="{file_name}"'
+        # Browser wants a specific part (seeking)
+        from_bytes, until_bytes = range_header.replace("bytes=", "").split("-")
+        from_bytes = int(from_bytes)
+        until_bytes = int(until_bytes) if until_bytes else file_size - 1
+        
+        content_length = until_bytes - from_bytes + 1
+        status = 206
+        
+        headers = {
+            "Content-Type": mime_type,
+            "Content-Range": f"bytes {from_bytes}-{until_bytes}/{file_size}",
+            "Content-Length": str(content_length),
+            "Accept-Ranges": "bytes",
+        }
     else:
-        headers["Content-Disposition"] = f'inline; filename="{file_name}"'
+        # Full download
+        from_bytes = 0
+        until_bytes = file_size - 1
+        content_length = file_size
+        status = 200
+        
+        headers = {
+            "Content-Type": mime_type,
+            "Content-Length": str(file_size),
+            "Accept-Ranges": "bytes",
+        }
+        if force_download:
+             headers["Content-Disposition"] = f'attachment; filename="{file_name}"'
+        else:
+             headers["Content-Disposition"] = f'inline; filename="{file_name}"'
 
-    response = web.StreamResponse(status=status_code, headers=headers)
+    response = web.StreamResponse(status=status, headers=headers)
     await response.prepare(request)
 
-    # --- PRECISE STREAMING LOGIC ---
-    # We must stream EXACTLY 'content_length' bytes, no more, no less.
-    
+    # Calculate offset and chunk limit for Pyrogram
+    # We stream exactly what the browser asked for
+    offset = from_bytes
+    limit = content_length 
+
     try:
-        # Tell Pyrogram to start fetching from 'start'
-        # We handle the 'end' manually to stop the generator
-        bytes_sent = 0
-        async for chunk in app.stream_media(msg, offset=start):
-            chunk_size = len(chunk)
-            
-            # If sending this whole chunk would exceed the requested range, trim it
-            if bytes_sent + chunk_size > content_length:
-                remaining_needed = content_length - bytes_sent
-                await response.write(chunk[:remaining_needed])
-                break
-            
+        async for chunk in app.stream_media(msg, offset=offset, limit=limit):
             await response.write(chunk)
-            bytes_sent += chunk_size
-            
-            # Stop if we have sent enough data
-            if bytes_sent >= content_length:
-                break
-                
-    except Exception as e:
-        print(f"Stream Error: {e}")
-        # Connection likely closed by browser (normal during seeking)
-        pass
+    except Exception:
+        pass # Handle client disconnection gracefully
 
     return response
 
 async def main():
     await app.start()
-    # Increase client_max_size to handle large headers if needed
     app_runner = web.AppRunner(web.Application(client_max_size=1024**3))
     app_runner.app.add_routes(routes)
     await app_runner.setup()
     site = web.TCPSite(app_runner, "0.0.0.0", PORT)
     await site.start()
+    
+    # Keep running
     import asyncio
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
     import asyncio
-    logging.basicConfig(level=logging.WARNING)
+    logging.basicConfig(level=logging.INFO)
     asyncio.run(main())
